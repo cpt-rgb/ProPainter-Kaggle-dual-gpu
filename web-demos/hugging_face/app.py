@@ -262,6 +262,9 @@ def vos_tracking_video(video_state, interactive_state, mask_dropdown):
 
 # inpaint 
 def inpaint_video(video_state, resize_ratio_number, dilate_radius_number, raft_iter_number, subvideo_length_number, neighbor_length_number, ref_stride_number, mask_dropdown):
+    model.samcontroler.sam_controler.reset_image()
+    torch.cuda.empty_cache()
+    
     operation_log = [("",""), ("Inpainting finished!","Normal")]
 
     frames = np.asarray(video_state["origin_images"])

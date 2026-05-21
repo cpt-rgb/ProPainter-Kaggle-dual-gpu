@@ -171,15 +171,15 @@ class ProInpainter:
 		# set up RAFT and flow competition model
 		##############################################
 
-		self.dev0 = self.device
-		self.dev1 = self.device
+		self.dev0 = 'cuda:0' # SAM, Cutie, RAFT
+		self.dev1 = 'cuda:1' if torch.cuda.device_count() > 1 else 'cuda:0' # Video, FlowComplete, ProPainter
 
 		self.fix_raft = RAFT_bi(raft_checkpoint, self.dev0)
 
 		self.fix_flow_complete = RecurrentFlowCompleteNet(flow_completion_checkpoint)
 		for p in self.fix_flow_complete.parameters():
 			p.requires_grad = False
-		self.fix_flow_complete.to(self.dev0)
+		self.fix_flow_complete.to(self.dev1)
 		self.fix_flow_complete.eval()
 
 		##############################################
@@ -218,7 +218,7 @@ class ProInpainter:
 		frames = to_tensors()(frames).unsqueeze(0) * 2 - 1    
 		flow_masks = to_tensors()(flow_masks).unsqueeze(0)
 		masks_dilated = to_tensors()(masks_dilated).unsqueeze(0)
-		frames, flow_masks, masks_dilated = (frames.to(self.dev0), flow_masks.to(self.dev0), masks_dilated.to(self.dev0))
+		frames, flow_masks, masks_dilated = (frames.to(self.dev1), flow_masks.to(self.dev1), masks_dilated.to(self.dev1))
 		
 		##############################################
 		# ProPainter inference
@@ -226,16 +226,16 @@ class ProInpainter:
 		video_length = frames.size(1)
 		with torch.no_grad():
 			# ---- compute flow ----
-			# if frames.size(-1) <= 640: 
-			# 	short_clip_len = 12
-			# elif frames.size(-1) <= 720: 
-			# 	short_clip_len = 8
-			# elif frames.size(-1) <= 1280:
-			# 	short_clip_len = 4
-			# else:
-			# 	short_clip_len = 2
+			if frames.size(-1) <= 640: 
+				short_clip_len = 12
+			elif frames.size(-1) <= 720: 
+				short_clip_len = 8
+			elif frames.size(-1) <= 1280:
+				short_clip_len = 4
+			else:
+				short_clip_len = 2
 			
-			short_clip_len = 2
+			# short_clip_len = 2
 
 			
 			# use fp32 for RAFT
@@ -244,19 +244,29 @@ class ProInpainter:
 				for f in range(0, video_length, short_clip_len):
 					end_f = min(video_length, f + short_clip_len)
 					if f == 0:
-						flows_f, flows_b = self.fix_raft(frames[:,f:end_f], iters=raft_iter)
+						# Send tiny chunk to GPU 0
+						slice_in = frames[:,f:end_f].to(self.dev0)
+						flows_f, flows_b = self.fix_raft(slice_in, iters=raft_iter)
 					else:
-						flows_f, flows_b = self.fix_raft(frames[:,f-1:end_f], iters=raft_iter)
+						slice_in = frames[:,f-1:end_f].to(self.dev0)
+						flows_f, flows_b = self.fix_raft(slice_in, iters=raft_iter)
 					
-					gt_flows_f_list.append(flows_f)
-					gt_flows_b_list.append(flows_b)
+					# Send results immediately back to GPU 1
+					gt_flows_f_list.append(flows_f.to(self.dev1))
+					gt_flows_b_list.append(flows_b.to(self.dev1))
+					
+					# Delete chunk from GPU 0 to prevent OOM
+					del slice_in, flows_f, flows_b
 					torch.cuda.empty_cache()
 					
 				gt_flows_f = torch.cat(gt_flows_f_list, dim=1)
 				gt_flows_b = torch.cat(gt_flows_b_list, dim=1)
 				gt_flows_bi = (gt_flows_f, gt_flows_b)
 			else:
-				gt_flows_bi = self.fix_raft(frames, iters=raft_iter)
+				slice_in = frames.to(self.dev0)
+				flows_f, flows_b = self.fix_raft(slice_in, iters=raft_iter)
+				gt_flows_bi = (flows_f.to(self.dev1), flows_b.to(self.dev1))
+				del slice_in, flows_f, flows_b
 				torch.cuda.empty_cache()
 
 			if self.use_half:
@@ -293,12 +303,6 @@ class ProInpainter:
 				pred_flows_bi = self.fix_flow_complete.combine_flow(gt_flows_bi, pred_flows_bi, flow_masks)
 				torch.cuda.empty_cache()
 
-			# --- GPU transfer to ProPainter GPU ---
-			pred_flows_bi = (pred_flows_bi[0].to(self.dev1), pred_flows_bi[1].to(self.dev1))
-
-			frames = frames.to(self.dev1)
-			flow_masks = flow_masks.to(self.dev1)
-			masks_dilated = masks_dilated.to(self.dev1)
 
 			# ---- image propagation ----
 			masked_frames = frames * (1 - masks_dilated)

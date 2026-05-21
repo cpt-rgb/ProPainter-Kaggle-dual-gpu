@@ -170,8 +170,10 @@ class ProInpainter:
 		##############################################
 		# set up RAFT and flow competition model
 		##############################################
-		self.dev0 = self.device
-		self.dev1 = self.device
+		self.dev0 = 'cuda:0'
+		self.dev1 = 'cuda:1' if torch.cuda.device_count() > 1 else 'cuda:0'
+		# self.dev0 = self.device
+		# self.dev1 = self.device
 
 		self.fix_raft = RAFT_bi(raft_checkpoint, self.dev0)
 
